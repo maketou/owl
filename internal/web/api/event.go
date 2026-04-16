@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gowvp/owl/internal/conf"
@@ -42,6 +43,9 @@ func NewEventAPI(core event.Core, conf *conf.Bootstrap) EventAPI {
 	return EventAPI{eventCore: core, conf: conf}
 }
 
+// RegisterEvent
+// 为什么让图片接口复用同级鉴权中间件：
+// 事件图片与事件列表属于同一安全域，统一鉴权策略可避免“列表受保护但原图可匿名访问”的越权缺口。
 func RegisterEvent(g gin.IRouter, api EventAPI, handler ...gin.HandlerFunc) {
 	{
 		group := g.Group("/events", handler...)
@@ -50,9 +54,7 @@ func RegisterEvent(g gin.IRouter, api EventAPI, handler ...gin.HandlerFunc) {
 		group.PUT("/:id", web.WrapH(api.editEvent))
 		group.DELETE("/:id", web.WrapH(api.delEvent))
 	}
-	// 图片接口不需要认证中间件
-	// TODO: 待添加鉴权
-	g.GET("/events/image/*path", api.getEventImage)
+	g.GET("/events/image/*path", append(handler, api.getEventImage)...)
 }
 
 // findEvents 分页查询事件列表
@@ -81,6 +83,9 @@ func (a EventAPI) delEvent(c *gin.Context, _ *struct{}) (*event.Event, error) {
 }
 
 // getEventImage 获取事件快照图片
+// getEventImage
+// 为什么采用 Abs+Rel 校验：
+// 仅靠字符串前缀在跨平台场景容易误判，Abs+Rel 可以从路径语义层保证访问始终被限制在 events 目录内。
 func (a EventAPI) getEventImage(c *gin.Context) {
 	imagePath := c.Param("path")
 	if imagePath == "" {
@@ -93,17 +98,26 @@ func (a EventAPI) getEventImage(c *gin.Context) {
 		imagePath = imagePath[1:]
 	}
 
-	fullPath := filepath.Join(system.Getwd(), "configs", "events", imagePath)
-
-	// 安全检查：防止路径遍历攻击
 	eventsDir := filepath.Join(system.Getwd(), "configs", "events")
+	absEventsDir, err := filepath.Abs(eventsDir)
+	if err != nil {
+		web.Fail(c, reason.ErrNotFound.SetMsg("invalid events dir"))
+		return
+	}
+
+	fullPath := filepath.Join(absEventsDir, imagePath)
 	absPath, err := filepath.Abs(fullPath)
-	if err != nil || !filepath.HasPrefix(absPath, eventsDir) {
+	if err != nil {
+		web.Fail(c, reason.ErrNotFound.SetMsg("invalid path"))
+		return
+	}
+	relPath, err := filepath.Rel(absEventsDir, absPath)
+	if err != nil || relPath == "." || relPath == "" || strings.HasPrefix(relPath, "..") {
 		web.Fail(c, reason.ErrNotFound.SetMsg("invalid path"))
 		return
 	}
 
-	body, err := os.ReadFile(fullPath)
+	body, err := os.ReadFile(absPath)
 	if err != nil {
 		web.Fail(c, reason.ErrNotFound.SetMsg(err.Error()))
 		return
